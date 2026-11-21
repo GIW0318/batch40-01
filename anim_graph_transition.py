@@ -44,36 +44,183 @@ Contract used by the tests
 class AnimGraphTransition:
     def __init__(self, max_queue=4):
         self.max_queue = max_queue
+        self._states = {}
+        self._current = None
+        self._phase = 0.0
+        self._transition = None
+        self._queue = []
+        self._invalid = False
 
     def add_state(self, name, duration, loop=True, events=None):
-        raise NotImplementedError
+        self._states[name] = {
+            "duration": float(duration),
+            "loop": loop,
+            "events": list(events or []),
+        }
 
     def play(self, name, phase=0.0):
-        raise NotImplementedError
+        self._require_state(name)
+        self._invalid = False
+        self._current = name
+        self._phase = float(phase)
+        self._transition = None
+        self._queue = []
 
     def transition_to(self, name, duration=0.25, interrupt=False):
-        raise NotImplementedError
+        if self._transition is not None:
+            if interrupt:
+                active = self._transition
+                continued_phase = active["tgt_last"]
+                self._transition = self._make_transition(
+                    active["target"], continued_phase, name, duration
+                )
+                return {
+                    "source": active["target"],
+                    "target": name,
+                    "duration": duration,
+                    "source_phase": continued_phase,
+                    "queued": False,
+                }
+            if name == self._transition["target"] or name in self._queue:
+                return {"queued": False}
+            if len(self._queue) >= self.max_queue:
+                return {"queued": False}
+            self._queue.append(name)
+            return {"queued": True}
+
+        self._require_state(name)
+        self._invalid = False
+        self._queue = []
+        self._transition = self._make_transition(
+            self._current, self._phase, name, duration
+        )
+        return {
+            "source": self._current,
+            "target": name,
+            "duration": duration,
+            "source_phase": self._phase,
+            "queued": False,
+        }
 
     def update(self, dt):
-        raise NotImplementedError
+        if self._invalid:
+            raise RuntimeError(
+                "animation graph was hot-reloaded; pending transitions are invalid"
+            )
+
+        active = self._transition
+        if active is None:
+            return {
+                "state": self._current,
+                "weight": 1.0,
+                "transition_active": False,
+                "events": [],
+            }
+
+        active["elapsed"] += dt
+
+        if active["duration"] <= 0.0:
+            self._current = active["target"]
+            self._phase = active["tgt_last"]
+            self._transition = None
+            return {
+                "state": active["target"],
+                "weight": 1.0,
+                "transition_active": False,
+                "events": [],
+            }
+
+        src_now = active["src_last"] + dt / self._state_duration(active["source"])
+        tgt_now = active["tgt_last"] + dt / self._state_duration(active["target"])
+        events = self._collect_events(active, src_now, tgt_now)
+        active["src_last"] = src_now
+        active["tgt_last"] = tgt_now
+
+        weight = min(1.0, active["elapsed"] / active["duration"])
+        if active["elapsed"] >= active["duration"]:
+            self._current = active["target"]
+            self._phase = tgt_now
+            self._transition = None
+            return {
+                "state": active["target"],
+                "weight": 1.0,
+                "transition_active": False,
+                "events": events,
+            }
+
+        return {
+            "state": active["source"],
+            "weight": weight,
+            "transition_active": True,
+            "events": events,
+        }
 
     def remap_phase(self, phase, from_duration, to_duration):
-        raise NotImplementedError
+        return phase * to_duration
 
     def bone_allowed(self, mask, bone):
-        raise NotImplementedError
+        if mask == "full":
+            return True
+        if mask == "upper":
+            if bone.startswith("finger_"):
+                return False
+            return any(part in bone for part in ("spine", "arm", "hand"))
+        return False
 
     def blend_root_motion(self, motions, weights):
-        raise NotImplementedError
+        return sum(motion * weight for motion, weight in zip(motions, weights))
 
     def blend_weight_at(self, duration, elapsed):
-        raise NotImplementedError
+        if elapsed < 0.0:
+            return 0.0
+        if duration <= 0.0:
+            return 1.0
+        return min(1.0, elapsed / duration)
 
     def combine_layer_weights(self, pairs):
-        raise NotImplementedError
+        total = sum(weight for _, weight in pairs)
+        if total <= 0.0:
+            raise ValueError("combined layer weights must have a positive total")
+        return {layer: weight / total for layer, weight in pairs}
 
     def hot_reload(self):
-        raise NotImplementedError
+        self._transition = None
+        self._queue = []
+        self._invalid = True
 
     def queue_size(self):
-        raise NotImplementedError
+        return len(self._queue)
+
+    def _make_transition(self, source, source_phase, target, duration):
+        self._require_state(target)
+        return {
+            "source": source,
+            "target": target,
+            "duration": float(duration),
+            "elapsed": 0.0,
+            "src_start": source_phase,
+            "src_last": source_phase,
+            "tgt_start": 0.0,
+            "tgt_last": 0.0,
+        }
+
+    def _collect_events(self, active, src_now, tgt_now):
+        fired = []
+        seen = set()
+
+        def scan(state_name, last, now):
+            for phase, event_name in self._states[state_name]["events"]:
+                if last < phase <= now and event_name not in seen:
+                    seen.add(event_name)
+                    fired.append(event_name)
+
+        scan(active["source"], active["src_last"], src_now)
+        scan(active["target"], active["tgt_last"], tgt_now)
+        return fired
+
+    def _state_duration(self, name):
+        return self._states[name]["duration"]
+
+    def _require_state(self, name):
+        if name not in self._states:
+            raise KeyError(name)
