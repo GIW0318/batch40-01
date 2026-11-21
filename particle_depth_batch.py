@@ -32,30 +32,74 @@ Contract used by the tests
 class ParticleDepthBatch:
     def __init__(self, sort_budget_ms=1.0):
         self.sort_budget_ms = sort_budget_ms
+        self._pool = []
+        self._next_id = 0
 
     def depth(self, particle, camera):
-        raise NotImplementedError
+        z = particle["pos"][2]
+        nearest_z = z + particle["size"] / 2.0
+        return camera[2] - nearest_z
 
     def sort_particles(self, particles, camera, budget_ms=None):
-        raise NotImplementedError
+        if budget_ms is None:
+            budget_ms = self.sort_budget_ms
+        cost_ms = len(particles) * 0.001
+        if cost_ms > budget_ms:
+            return {
+                "order": particles,
+                "sorted": False,
+                "budget_exceeded": True,
+                "cost_ms": cost_ms,
+            }
+        order = sorted(
+            particles,
+            key=lambda particle: (
+                -self.depth(particle, camera),
+                particle["id"],
+            ),
+        )
+        return {
+            "order": order,
+            "sorted": True,
+            "budget_exceeded": False,
+            "cost_ms": cost_ms,
+        }
 
     def visible(self, particle, near):
-        raise NotImplementedError
+        return particle["pos"][2] + particle["size"] / 2.0 > near
 
     def depth_write(self, particle):
-        raise NotImplementedError
+        return particle["alpha"] >= 1.0
 
     def acquire(self, emitter):
-        raise NotImplementedError
+        if self._pool:
+            particle = self._pool.pop()
+        else:
+            particle = {"id": self._next_id}
+            self._next_id += 1
+        particle["emitter"] = emitter
+        particle["alive"] = False
+        particle["sort_index"] = None
+        return particle
 
     def release(self, particle):
-        raise NotImplementedError
+        particle["alive"] = False
+        particle["sort_index"] = None
+        self._pool.append(particle)
 
     def generate_chunks(self, chunks):
-        raise NotImplementedError
+        particles = []
+        for chunk in chunks:
+            particles.extend(chunk)
+        particles.sort(key=lambda particle: particle["id"])
+        return particles
 
     def required_index_bits(self, count):
-        raise NotImplementedError
+        return max(1, (count - 1).bit_length())
 
     def encode_index(self, index, bits):
-        raise NotImplementedError
+        if not 0 <= index < (1 << bits):
+            raise OverflowError(
+                f"index {index} does not fit in {bits} bits"
+            )
+        return index
